@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -30,6 +31,7 @@ import * as EnvironmentAuthPolicy from "./EnvironmentAuthPolicy.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
+import { verifyRequestDpopProof } from "./dpop.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 export const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -60,6 +62,7 @@ export interface AuthenticatedSession {
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
 }
 
@@ -106,6 +109,9 @@ export interface EnvironmentAuthShape {
     credential: string,
     requestedScopes: ReadonlyArray<AuthEnvironmentScope> | undefined,
     requestMetadata: AuthClientMetadata,
+    input?: {
+      readonly proofKeyThumbprint?: string;
+    },
   ) => Effect.Effect<
     AuthAccessTokenResult,
     ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
@@ -115,6 +121,7 @@ export interface EnvironmentAuthShape {
     readonly label?: string;
     readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
     readonly subject?: string;
+    readonly proofKeyThumbprint?: string;
   }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
   readonly issuePairingCredential: (
     input?: AuthCreatePairingCredentialInput,
@@ -183,6 +190,7 @@ type BootstrapExchangeResult = {
 };
 
 const AUTHORIZATION_PREFIX = "Bearer ";
+const DPOP_AUTHORIZATION_PREFIX = "DPoP ";
 const WEBSOCKET_TICKET_QUERY_PARAM = "wsTicket";
 
 const bySessionPriority = (left: AuthClientSession, right: AuthClientSession) => {
@@ -244,10 +252,21 @@ function parseBearerToken(request: HttpServerRequest.HttpServerRequest): string 
   return token.length > 0 ? token : null;
 }
 
+function parseDpopToken(request: HttpServerRequest.HttpServerRequest): string | null {
+  const header = request.headers["authorization"];
+  if (typeof header !== "string" || !header.startsWith(DPOP_AUTHORIZATION_PREFIX)) {
+    return null;
+  }
+  const token = header.slice(DPOP_AUTHORIZATION_PREFIX.length).trim();
+  return token.length > 0 ? token : null;
+}
+
 export const make = Effect.fn("makeEnvironmentAuth")(function* () {
   const policy = yield* EnvironmentAuthPolicy.EnvironmentAuthPolicy;
   const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
   const sessions = yield* SessionStore.SessionStore;
+  const secretStore = yield* ServerSecretStore.ServerSecretStore;
+  const crypto = yield* Crypto.Crypto;
   const descriptor = yield* policy.getDescriptor();
 
   const authenticateToken = (
@@ -269,6 +288,7 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
         subject: session.subject,
         method: session.method,
         scopes: session.scopes,
+        ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
       })),
       mapSessionVerificationErrors,
@@ -277,11 +297,43 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
   const authenticateRequest = (request: HttpServerRequest.HttpServerRequest) => {
     const cookieToken = request.cookies[sessions.cookieName];
     const bearerToken = parseBearerToken(request);
-    const credential = cookieToken ?? bearerToken;
+    const dpopToken = parseDpopToken(request);
+    const credential = cookieToken ?? bearerToken ?? dpopToken;
     if (!credential) {
       return Effect.fail(new ServerAuthInvalidCredentialError({ reason: "missing_credential" }));
     }
-    return authenticateToken(credential);
+    return authenticateToken(credential).pipe(
+      Effect.flatMap((session) => {
+        if (session.proofKeyThumbprint) {
+          if (!dpopToken || dpopToken !== credential) {
+            return Effect.fail(
+              new ServerAuthInvalidCredentialError({
+                reason: "invalid_credential",
+                cause: "DPoP-bound access token requires DPoP authorization.",
+              }),
+            );
+          }
+          return verifyRequestDpopProof({
+            request,
+            expectedThumbprint: session.proofKeyThumbprint,
+            expectedAccessToken: dpopToken,
+          }).pipe(
+            Effect.provideService(ServerSecretStore.ServerSecretStore, secretStore),
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.as(session),
+          );
+        }
+        if (dpopToken) {
+          return Effect.fail(
+            new ServerAuthInvalidCredentialError({
+              reason: "invalid_credential",
+              cause: "DPoP authorization requires a proof-bound access token.",
+            }),
+          );
+        }
+        return Effect.succeed(session);
+      }),
+    );
   };
 
   const getSessionState: EnvironmentAuthShape["getSessionState"] = (request) =>
@@ -348,8 +400,8 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
     );
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuthShape["exchangeBootstrapCredentialForAccessToken"] =
-    (credential, requestedScopes, requestMetadata) =>
-      bootstrapCredentials.consume(credential).pipe(
+    (credential, requestedScopes, requestMetadata, input) =>
+      bootstrapCredentials.consume(credential, input).pipe(
         Effect.mapError(toBootstrapExchangeError),
         Effect.flatMap((grant) =>
           Effect.gen(function* () {
@@ -361,9 +413,15 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
             }
             return yield* sessions
               .issue({
-                method: "bearer-access-token",
+                method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
                 subject: grant.subject,
                 scopes: grantedScopes,
+                ...(input?.proofKeyThumbprint
+                  ? {
+                      proofKeyThumbprint: input.proofKeyThumbprint,
+                      ttl: Duration.hours(1),
+                    }
+                  : {}),
                 client: {
                   ...requestMetadata,
                   ...(grant.label ? { label: grant.label } : {}),
@@ -387,7 +445,7 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
                 ({
                   access_token: session.token,
                   issued_token_type: AuthAccessTokenType,
-                  token_type: "Bearer",
+                  token_type: input?.proofKeyThumbprint ? "DPoP" : "Bearer",
                   expires_in: Math.max(
                     0,
                     Math.floor(
@@ -433,6 +491,7 @@ export const make = Effect.fn("makeEnvironmentAuth")(function* () {
         subject: input?.subject ?? "one-time-token",
         ...(input?.ttl ? { ttl: input.ttl } : {}),
         ...(input?.label ? { label: input.label } : {}),
+        ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
       });
       return {
         id: issued.id,

@@ -32,6 +32,32 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
+import { verifyRequestDpopProof } from "./dpop.ts";
+
+const CREDENTIAL_RESPONSE_HEADERS = {
+  "cache-control": "no-store",
+  pragma: "no-cache",
+} as const;
+
+const appendCredentialResponseHeaders = HttpEffect.appendPreResponseHandler((_request, response) =>
+  Effect.succeed(HttpServerResponse.setHeaders(response, CREDENTIAL_RESPONSE_HEADERS)),
+);
+
+const appendDpopChallengeHeader = HttpEffect.appendPreResponseHandler((_request, response) =>
+  Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", "DPoP")),
+);
+
+const appendDpopChallengeOnUnauthorized = (error: EnvironmentAuthInvalidError) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const usesDpop =
+      (request.originalUrl.startsWith("/oauth/token") && request.headers.dpop !== undefined) ||
+      request.headers.authorization?.startsWith("DPoP ") === true;
+    if (usesDpop) {
+      yield* appendDpopChallengeHeader;
+    }
+    return yield* error;
+  });
 
 export const currentEnvironmentTraceId = Effect.currentParentSpan.pipe(
   Effect.map((span) => span.traceId),
@@ -150,7 +176,7 @@ export const environmentAuthenticatedAuthLayer = Layer.effect(
             scopes: new Set(session.scopes),
           }),
         );
-      });
+      }).pipe(Effect.catchTag("EnvironmentAuthInvalidError", appendDpopChallengeOnUnauthorized));
   }),
 );
 
@@ -197,6 +223,7 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             yield* HttpEffect.appendPreResponseHandler((_request, response) =>
               Effect.succeed(HttpServerResponse.mergeCookies(response, sessionCookies)),
             );
+            yield* appendCredentialResponseHeaders;
             return result.response;
           },
           Effect.catchTags({
@@ -226,8 +253,22 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                       AuthRelayManageScope,
                     ]),
                   });
-            if (requestedScopes === null)
+            if (requestedScopes === null) {
               return yield* failEnvironmentInvalidRequest("invalid_scope");
+            }
+            const proofKeyThumbprint = args.headers.dpop
+              ? yield* verifyRequestDpopProof({ request }).pipe(
+                  Effect.catchTags({
+                    ServerAuthInvalidCredentialError: () =>
+                      appendDpopChallengeHeader.pipe(
+                        Effect.andThen(failEnvironmentAuthInvalid("invalid_credential")),
+                      ),
+                    ServerAuthInternalError: (error) =>
+                      failEnvironmentInternal("access_token_issuance_failed", error),
+                  }),
+                )
+              : undefined;
+            yield* appendCredentialResponseHeaders;
             return yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
               args.payload.subject_token,
               requestedScopes,
@@ -241,6 +282,7 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                   ...(args.payload.client_os ? { os: args.payload.client_os } : {}),
                 },
               }),
+              proofKeyThumbprint ? { proofKeyThumbprint } : undefined,
             );
           },
           Effect.catchTags({
@@ -257,6 +299,7 @@ export const authHttpApiLayer = HttpApiBuilder.group(
           function* (args) {
             yield* annotateEnvironmentRequest(args.endpoint.name);
             const session = yield* EnvironmentAuthenticatedPrincipal;
+            yield* appendCredentialResponseHeaders;
             return yield* serverAuth.issueWebSocketTicket(session);
           },
           Effect.catchTag("ServerAuthInternalError", (error) =>
