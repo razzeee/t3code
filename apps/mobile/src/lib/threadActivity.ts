@@ -1039,7 +1039,9 @@ export function workEntryRowLabel(entry: WorkLogEntry, expanded = false): string
   const presentation = resolveWorkEntryToolPresentation(entry);
   if (presentation) return presentation.displayName;
   if (expanded && entry.command?.trim()) return "Command";
-  if (!expanded && entry.itemType && entry.toolTitle) return workEntryHeading(entry);
+  if (!expanded && entry.itemType && entry.toolTitle && !entry.command) {
+    return workEntryHeading(entry);
+  }
   const preview = workEntryPreview(entry);
   if (expanded) return preview?.trim() || workEntryHeading(entry);
   const compactPreview = preview === null ? null : collapseWhitespace(stripShellWrapper(preview));
